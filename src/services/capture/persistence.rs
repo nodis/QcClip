@@ -20,7 +20,7 @@ use super::{
 use crate::services::{
     application_icon::{ApplicationIconStore, upsert_application_icon},
     database::{Database, LIST_ORDER_GAP},
-    storage::{RawBlob, RawBlobStore},
+    storage::{RawBlob, RawBlobStore, image_extension_from_header, save_images_as_files},
 };
 
 const DEFAULT_INLINE_THRESHOLD: usize = 64 * 1024;
@@ -266,7 +266,13 @@ impl CaptureService {
                     // 已在加载合并候选时校验过原文件，同一事务内直接复用，避免重新压缩和落盘。
                     ("external", None, Some(*blob_id), bytes.len() as i64)
                 } else {
-                    let pending = self.blob_store.write_pending(bytes)?;
+                    // 开启图片原样保存时跳过压缩，其余内容仍按原有方式压缩存储
+                    let pending = match image_extension_from_header(bytes) {
+                        Some(extension) if save_images_as_files() => {
+                            self.blob_store.write_pending_raw(bytes, extension)?
+                        }
+                        _ => self.blob_store.write_pending(bytes)?,
+                    };
                     let blob = self.blob_store.commit_pending(&pending)?;
                     let blob_id = upsert_binary_blob(&transaction, &blob, timestamp)?;
                     ("external", None, Some(blob_id), bytes.len() as i64)
