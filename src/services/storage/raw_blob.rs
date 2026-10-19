@@ -14,6 +14,8 @@ use crate::services::data_runtime;
 
 const DATA_DIRECTORY: &str = "data";
 const PENDING_DIRECTORY: &str = ".pending";
+/// 原样保存的图片单独存放，避免在满是哈希文件的数据目录里不好找。
+const IMAGES_DIRECTORY: &str = "images";
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 /// 是否把图片以可直接打开的文件形式落盘。
@@ -46,6 +48,11 @@ pub fn image_extension_from_header(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// 判断扩展名是否属于原样保存的图片，用于决定落盘目录。
+fn is_image_extension(extension: &str) -> bool {
+    matches!(extension, "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -338,6 +345,8 @@ impl RawBlobStore {
             pending.compression,
             pending.raw_extension.as_deref(),
         );
+        // 路径校验会规范化父目录，所以必须先建目录再解析路径
+        self.ensure_parent_directory(&blob.relative_path)?;
         let target_path = self.resolve_relative_path(&blob.relative_path)?;
         if target_path.exists() {
             self.verify_file(
@@ -476,25 +485,13 @@ impl RawBlobStore {
             }
         }
 
-        let entries = fs::read_dir(&self.data_directory).map_err(|source| RawBlobError::Scan {
-            path: self.data_directory.clone(),
-            source,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| RawBlobError::Scan {
-                path: self.data_directory.clone(),
-                source,
-            })?;
-            let file_type = entry.file_type().map_err(|source| RawBlobError::Scan {
-                path: entry.path(),
-                source,
-            })?;
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            if !file_type.is_file() || !is_managed_data_file(file_name.as_ref()) {
-                continue;
-            }
-            let relative_path = PathBuf::from(DATA_DIRECTORY).join(entry.file_name());
+        let mut managed = Vec::new();
+        collect_managed_files(
+            &self.data_directory,
+            Path::new(DATA_DIRECTORY),
+            &mut managed,
+        )?;
+        for relative_path in managed {
             if !referenced_paths.contains(&relative_path) {
                 report.orphan_files.push(relative_path);
             }
@@ -527,12 +524,31 @@ impl RawBlobStore {
         compression: BlobCompression,
         raw_extension: Option<&str>,
     ) -> RawBlob {
+        // 原样保存的图片放进 images 子目录，压缩块保持数据库根目录不变
+        let mut relative_path = PathBuf::from(DATA_DIRECTORY);
+        if let Some(extension) = raw_extension {
+            if is_image_extension(extension) && compression == BlobCompression::None {
+                relative_path.push(IMAGES_DIRECTORY);
+            }
+        }
+        relative_path.push(compression.file_name(&sha256, raw_extension));
         RawBlob {
             sha256,
             byte_length,
-            relative_path: PathBuf::from(DATA_DIRECTORY)
-                .join(compression.file_name(&sha256, raw_extension)),
+            relative_path,
         }
+    }
+
+    /// 创建数据文件所需的父目录，图片子目录在第一次写入前还不存在。
+    fn ensure_parent_directory(&self, relative_path: &Path) -> Result<(), RawBlobError> {
+        let Some(parent) = relative_path.parent() else {
+            return Ok(());
+        };
+        if parent == Path::new(DATA_DIRECTORY) {
+            return Ok(());
+        }
+        let path = self.root.join(parent);
+        fs::create_dir_all(&path).map_err(|source| RawBlobError::CreateDirectory { path, source })
     }
 
     fn resolve_relative_path(&self, relative_path: &Path) -> Result<PathBuf, RawBlobError> {
@@ -558,12 +574,19 @@ impl RawBlobStore {
                 .ok_or_else(|| RawBlobError::InvalidRelativePath {
                     path: relative_path.to_path_buf(),
                 })?;
-            let canonical_parent =
-                dunce::canonicalize(parent).map_err(|source| RawBlobError::Read {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            canonical_parent.join(path.file_name().unwrap_or_default())
+            // 父目录可能尚未创建（例如首次写入前的 images 子目录），
+            // 此时路径上不可能存在指向外部的符号链接，直接用字面路径做边界判断；
+            // 若直接对不存在的父目录做规范化，整个扫描会因为读错误中断。
+            match dunce::canonicalize(parent) {
+                Ok(canonical_parent) => canonical_parent.join(path.file_name().unwrap_or_default()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => path.clone(),
+                Err(source) => {
+                    return Err(RawBlobError::Read {
+                        path: parent.to_path_buf(),
+                        source,
+                    });
+                }
+            }
         };
         if !boundary_path.starts_with(&self.data_directory) {
             return Err(RawBlobError::InvalidRelativePath {
@@ -782,12 +805,51 @@ fn is_managed_data_file(file_name: &str) -> bool {
     if file_name.ends_with(".bin") || file_name.ends_with(".bin.zst") {
         return true;
     }
-    matches!(
-        Path::new(file_name)
-            .extension()
-            .and_then(|value| value.to_str()),
-        Some("png" | "jpg" | "gif" | "webp")
-    )
+    Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_image_extension)
+}
+
+/// 递归收集数据目录中由本模块管理的文件，图片子目录下探一层。
+///
+/// 图片改为存放在 `data/images` 之后，只扫根目录会漏掉它们，
+/// 孤儿文件就检测不出来，所以这里要跟着下探。
+fn collect_managed_files(
+    directory: &Path,
+    relative_prefix: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), RawBlobError> {
+    let entries = fs::read_dir(directory).map_err(|source| RawBlobError::Scan {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| RawBlobError::Scan {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| RawBlobError::Scan {
+            path: entry.path(),
+            source,
+        })?;
+        let file_name = entry.file_name();
+        let relative_path = relative_prefix.join(&file_name);
+        if file_type.is_dir() {
+            // 只下探图片子目录，其余目录不属于本模块管理的存储范围
+            if file_name.to_string_lossy().as_ref() == IMAGES_DIRECTORY {
+                collect_managed_files(&entry.path(), &relative_path, output)?;
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if is_managed_data_file(file_name.to_string_lossy().as_ref()) {
+            output.push(relative_path);
+        }
+    }
+    Ok(())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -947,8 +1009,38 @@ mod tests {
         assert_eq!(pending.compression, BlobCompression::None);
 
         let blob = store.commit_pending(&pending).expect("无法提交原样图片");
-        assert!(blob.relative_path().to_string_lossy().ends_with(".png"));
+        // 图片落到独立的 images 子目录，避免和哈希命名的压缩块混在一起
+        assert_eq!(
+            blob.relative_path(),
+            Path::new("data/images").join(format!("{}.png", encode_hex(blob.sha256())))
+        );
         assert_eq!(store.read(&blob).expect("无法读取原样图片"), bytes);
+    }
+
+    #[test]
+    fn reconcile_scans_image_directory() {
+        let (_directory, store) = store();
+        let bytes = vec![0x5a; 256 * 1024];
+        let pending = store
+            .write_pending_raw(&bytes, "png")
+            .expect("无法写入原样图片");
+        let blob = store.commit_pending(&pending).expect("无法提交原样图片");
+
+        // 被引用的图片文件不算孤儿
+        let report = store
+            .reconcile(std::slice::from_ref(&blob))
+            .expect("扫描失败");
+        assert!(report.verified_blobs.contains(&blob));
+        assert!(report.orphan_files.is_empty());
+
+        // 子目录里未被引用的图片仍能被识别为孤儿
+        let orphan = blob.relative_path().with_file_name("ffffffff.png");
+        let orphan_path = store.root.join(&orphan);
+        fs::copy(store.root.join(blob.relative_path()), &orphan_path).expect("无法复制图片");
+        let report = store
+            .reconcile(std::slice::from_ref(&blob))
+            .expect("扫描失败");
+        assert_eq!(report.orphan_files, vec![orphan]);
     }
 
     #[test]
