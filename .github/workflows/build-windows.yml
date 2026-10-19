@@ -108,3 +108,9 @@ jobs:
             dist/QcClip/QcClip.portable
           if-no-files-found: error
           retention-days: 30
+
+      - name: 单元测试
+        # 产物已上传，这一步单独验证测试代码；失败会标红，但不影响已经上传的产物
+        run: |
+          cargo test --release --locked --target x86_64-pc-windows-msvc --bins
+          if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }
