@@ -55,6 +55,18 @@ fn is_image_extension(extension: &str) -> bool {
     matches!(extension, "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
+/// 同一张图的多个格式里，数字越小越优先落成明文文件。
+///
+/// PNG 无损且通用，优先；WebP 次之；JPEG 有损但兼容性好；GIF 只用于动图。
+pub fn image_extension_rank(extension: &str) -> u8 {
+    match extension {
+        "png" => 0,
+        "webp" => 1,
+        "jpg" | "jpeg" => 2,
+        _ => 3,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BlobCompression {
     None,
@@ -1059,6 +1071,13 @@ mod tests {
             Some("webp")
         );
         assert_eq!(image_extension_from_header(b"plain text"), None);
+    }
+
+    #[test]
+    fn image_extension_rank_prefers_lossless_then_webp() {
+        assert!(image_extension_rank("png") < image_extension_rank("webp"));
+        assert!(image_extension_rank("webp") < image_extension_rank("jpg"));
+        assert_eq!(image_extension_rank("jpg"), image_extension_rank("jpeg"));
     }
 
     #[test]
