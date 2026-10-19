@@ -1,0 +1,61 @@
+# 用途：单独跑单元测试，与构建产物解耦
+# 说明：构建流水线为了压缩体积启用了 panic=abort，而测试需要 panic=unwind，两者不能混在同一次构建里
+# 触发：Actions 页面手动点运行，或提 PR 前手动触发一次
+
+name: 单元测试
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 不使用构建流水线里的发布配置：测试要保留 unwind 和符号，否则测试框架无法运行
+  CARGO_PROFILE_RELEASE_LTO: 'false'
+  CARGO_PROFILE_RELEASE_PANIC: unwind
+  CARGO_PROFILE_RELEASE_DEBUG: 'false'
+  CMAKE_GENERATOR: Ninja
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  test:
+    name: 运行单元测试 x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 安装项目指定的 Rust 工具链
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw '安装 Rust 工具链失败' }
+
+      - name: 初始化 MSVC x64 编译环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 与构建流水线分开缓存，避免两边来回覆盖
+          key: fork-test
+          cache-on-failure: true
+
+      - name: 运行测试
+        run: |
+          # 只跑 src 里的单元测试；tests 目录下的集成测试涉及窗口与单实例，需要真实桌面环境
+          cargo test --release --locked --target x86_64-pc-windows-msvc --bins
+          if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }

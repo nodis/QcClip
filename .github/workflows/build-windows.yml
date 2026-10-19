@@ -1,6 +1,6 @@
 # 用途：在 GitHub 的 Windows 机器上编译 QcClip，产出可直接双击运行的便携版
 # 放置位置：fork 仓库的 .github/workflows/build-windows.yml
-# 与仓库自带的 release.yml 区别：只编 x64 一个架构、不开 fat LTO、不打安装包、不发 Release，只上传可下载的压缩包
+# 与仓库自带的 release.yml 区别：只编 x64 一个架构、不打安装包、不发 Release，只上传可下载的压缩包
 
 name: 构建 Windows 便携版
 
@@ -21,8 +21,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # 去掉调试符号，产物体积能小一大截，验证阶段用不上符号
+  # 以下六项与作者 release.yml 的发布配置一致，是产物体积的主要影响因素
+  CARGO_PROFILE_RELEASE_LTO: fat
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+  CARGO_PROFILE_RELEASE_PANIC: abort
   CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_PROFILE_RELEASE_DEBUG: 'false'
+  CARGO_PROFILE_RELEASE_INCREMENTAL: 'false'
+  CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: 'false'
+  CMAKE_GENERATOR: Ninja
 
 defaults:
   run:
@@ -108,9 +115,3 @@ jobs:
             dist/QcClip/QcClip.portable
           if-no-files-found: error
           retention-days: 30
-
-      - name: 单元测试
-        # 产物已上传，这一步单独验证测试代码；失败会标红，但不影响已经上传的产物
-        run: |
-          cargo test --release --locked --target x86_64-pc-windows-msvc --bins
-          if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }
