@@ -1,0 +1,110 @@
+# 用途：在 GitHub 的 Windows 机器上编译 QcClip，产出可直接双击运行的便携版
+# 放置位置：fork 仓库的 .github/workflows/build-windows.yml
+# 与仓库自带的 release.yml 区别：只编 x64 一个架构、不开 fat LTO、不打安装包、不发 Release，只上传可下载的压缩包
+
+name: 构建 Windows 便携版
+
+on:
+  # 在 Actions 页面手动点运行
+  workflow_dispatch:
+  # 往 main 分支提交代码时自动运行
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 去掉调试符号，产物体积能小一大截，验证阶段用不上符号
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    name: 编译并打包 x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 安装项目指定的 Rust 工具链
+        run: |
+          # rust-toolchain.toml 里固定了版本，rustup 会自动下载对应工具链
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw '安装 Rust 工具链失败' }
+          rustc --version
+          cargo --version
+
+      - name: 初始化 MSVC x64 编译环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 缓存 Cargo 依赖与编译产物
+        # 第一次构建没有缓存，会比较慢；第二次开始只编改动过的部分
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fork-x64
+          cache-on-failure: true
+
+      - name: 编译
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw '编译失败' }
+
+      - name: 组装便携版
+        run: |
+          $root = 'dist/QcClip'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/QcClip.exe' -Destination $root
+
+          # 带上 VC 运行库，避免换机器运行时提示缺少 vcruntime140.dll
+          $runtime = Join-Path $env:VCToolsRedistDir 'x64\Microsoft.VC143.CRT\vcruntime140.dll'
+          if (Test-Path -LiteralPath $runtime) {
+            Copy-Item -LiteralPath $runtime -Destination $root
+          } else {
+            Write-Host "未找到 vcruntime140.dll，跳过：$runtime"
+          }
+
+          # 这个空文件是便携模式的开关标记，与官方便携版保持一致
+          New-Item -ItemType File -Path (Join-Path $root 'QcClip.portable') | Out-Null
+
+          Compress-Archive -LiteralPath $root -DestinationPath 'dist/QcClip-patched-x64-portable.zip' -CompressionLevel Optimal -Force
+          Get-ChildItem 'dist' -File | Format-Table Name, Length
+
+      - name: 记录产物信息
+        run: |
+          $zip = 'dist/QcClip-patched-x64-portable.zip'
+          $exe = 'target/x86_64-pc-windows-msvc/release/QcClip.exe'
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          @(
+            '### 构建产物'
+            ''
+            "- 程序体积：$([math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)) MB"
+            "- 压缩包体积：$([math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 1)) MB"
+            "- 程序 SHA256：$hash"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          # 直接上传三个文件，下载解压后双击 exe 就能跑，不用再解一层
+          name: QcClip-patched-x64
+          path: |
+            dist/QcClip/QcClip.exe
+            dist/QcClip/vcruntime140.dll
+            dist/QcClip/QcClip.portable
+          if-no-files-found: error
+          retention-days: 30
